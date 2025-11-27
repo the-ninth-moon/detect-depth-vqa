@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# IDE / Editor files
+.idea/
+.vscode/
+
+# 大型模型文件 (GitHub 有100MB的上传限制)
+*.pt
+*.pth
