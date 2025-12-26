@@ -11,3 +11,7 @@ venv/
 # 大型模型文件 (GitHub 有100MB的上传限制)
 *.pt
 *.pth
+*.mp4
+*.tar
+*.zip
+*.rar

@@ -10,39 +10,71 @@ import json
 from collections import deque
 from PIL import Image
 
-# ModelScope 引用
+# ==========================================
+# 恢复你的原始引用，不做修改
+# ==========================================
 from modelscope import Qwen3VLForConditionalGeneration, AutoProcessor
 
 
 # ==========================================
-# 1. 基础工具 & FPS 控制器 (新增)
+# 0. 【新增】中文指令解析工具 (纯逻辑，不影响模型)
+# ==========================================
+class CommandParser:
+    """
+    解析中文指令，提取目标名称和索引逻辑。
+    """
+    CN_NUM = {'一': 0, '二': 1, '两': 1, '三': 2, '四': 3, '五': 4, '六': 5, '七': 6, '八': 7, '九': 8, '十': 9}
+
+    @staticmethod
+    def parse(text):
+        text = text.strip()
+        index = 0
+        reverse = False  # 是否倒序
+
+        # 1. 处理 "倒数"、"最后"、"最右"
+        if "倒数" in text or "最后" in text or "最右" in text:
+            reverse = True
+            text = text.replace("倒数", "").replace("最后", "").replace("最右", "").replace("边", "").replace("面", "")
+
+        # 2. 处理 "第X个/棵/只"
+        match = re.search(r'第([一二两三四五六七八九十\d]+)[个棵只条辆位]', text)
+        if match:
+            num_str = match.group(1)
+            if num_str.isdigit():
+                idx_val = int(num_str) - 1
+            else:
+                idx_val = CommandParser.CN_NUM.get(num_str, 0)
+            index = max(0, idx_val)
+            split_idx = match.end()
+            target_obj = text[split_idx:].strip()
+        else:
+            target_obj = text
+
+        target_obj = target_obj.replace("的", "").strip()
+        if not target_obj: target_obj = text
+
+        return target_obj, index, reverse
+
+
+# ==========================================
+# 1. 基础工具 & FPS 控制器
 # ==========================================
 class VideoFPSController:
-    """
-    用于控制视频播放速度，使其接近原始 FPS
-    """
-
     def __init__(self, cap):
         self.fps = cap.get(cv2.CAP_PROP_FPS)
         if self.fps <= 0 or np.isnan(self.fps):
-            self.fps = 30.0  # 默认兜底
+            self.fps = 30.0
         self.target_interval = 1.0 / self.fps
-        print(f"[System] Video FPS: {self.fps:.2f}, Target Interval: {self.target_interval:.4f}s")
 
     def sync(self, start_time):
-        """
-        计算需要等待多久才能保持 1倍速
-        """
         process_duration = time.time() - start_time
         wait_time_sec = self.target_interval - process_duration
-
-        # 转换为毫秒，至少等待 1ms
         wait_ms = max(1, int(wait_time_sec * 1000))
         return wait_ms
 
 
 # ==========================================
-# 2. Qwen-VL 封装器 (含 Resize 优化)
+# 2. Qwen-VL 封装器 (恢复你的原始逻辑)
 # ==========================================
 class QwenWrapper:
     def __init__(self, model_path):
@@ -50,9 +82,10 @@ class QwenWrapper:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         try:
+            # 【关键修正】恢复使用 Qwen3VLForConditionalGeneration
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_path,
-                dtype="auto",
+                dtype="auto",  # 保持auto，让它自动读取config
                 device_map="auto",
             ).eval()
             self.processor = AutoProcessor.from_pretrained(model_path)
@@ -62,30 +95,25 @@ class QwenWrapper:
             raise e
 
     def _load_image(self, image_input, max_size=1024):
-        """
-        加载并Resize图片，避免送入过大分辨率导致推理极慢
-        """
+        # 保持你的 Resize 逻辑不变
         if isinstance(image_input, np.ndarray):
             pil_img = Image.fromarray(cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB))
         else:
             pil_img = Image.open(image_input).convert("RGB")
 
-        # 优化：按比例缩小图片，最大边不超过 max_size
         w, h = pil_img.size
         if w > max_size or h > max_size:
             scale = min(max_size / w, max_size / h)
             new_w, new_h = int(w * scale), int(h * scale)
             pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
         return pil_img
 
     def detect_objects(self, image_input, target_text):
-        # 注意：这里加载的是可能 resize 过的图片
         image = self._load_image(image_input)
-        w_img, h_img = image.size  # 获取 resize 后的尺寸
 
+        # 提示词微调：强制要求检测所有目标，以便我们做排序
         prompt_text = (
-            f"Detect '{target_text}'. "
+            f"Detect all '{target_text}' in the image. "
             "Output the result in JSON format only. "
             "The JSON should contain a list of objects with 'label' and 'bbox_2d'. "
             "The 'bbox_2d' must be [xmin, ymin, xmax, ymax] normalized to 1000."
@@ -108,7 +136,7 @@ class QwenWrapper:
         inputs = inputs.to(self.model.device)
 
         with torch.no_grad():
-            generated_ids = self.model.generate(**inputs, max_new_tokens=256)
+            generated_ids = self.model.generate(**inputs, max_new_tokens=512)  # 增加token长度以容纳多个目标
 
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -118,8 +146,6 @@ class QwenWrapper:
         )[0]
 
         results = []
-
-        # 获取原始输入的尺寸，用于最终坐标还原
         if isinstance(image_input, np.ndarray):
             orig_h, orig_w = image_input.shape[:2]
         else:
@@ -142,24 +168,23 @@ class QwenWrapper:
             for item in data:
                 if "bbox_2d" in item:
                     x1_n, y1_n, x2_n, y2_n = item["bbox_2d"]
-
-                    # 坐标转换：
-                    # 1. 归一化 -> Resize后的尺寸
-                    # 2. 实际上 Qwen 输出的是相对于输入 image 的坐标
-                    #    所以我们只需要把 normalized(0-1000) 映射回 原始尺寸(orig_w, orig_h)
-
                     x1 = x1_n * orig_w / 1000
                     y1 = y1_n * orig_h / 1000
                     x2 = x2_n * orig_w / 1000
                     y2 = y2_n * orig_h / 1000
-
                     bbox = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
                     results.append({"label": target_text, "bbox": bbox})
 
         except Exception as e:
-            # print(f"[Warning] JSON parse failed, trying regex... {e}")
-            pattern = r"\((\d+),\s*(\d+)\),\s*\((\d+),\s*(\d+)\)"
+            # print(f"[Warning] JSON parse failed: {e}, text: {output_text}")
+            # 兼容正则解析
+            pattern = r"\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]"  # Qwen3 可能的格式
             matches = re.findall(pattern, output_text)
+            if not matches:
+                # 尝试另一种格式
+                pattern = r"\((\d+),\s*(\d+)\),\s*\((\d+),\s*(\d+)\)"
+                matches = re.findall(pattern, output_text)
+
             for match in matches:
                 val1, val2, val3, val4 = map(int, match)
                 x1 = val1 * orig_w / 1000
@@ -172,8 +197,7 @@ class QwenWrapper:
         return results
 
     def ask_question(self, image_input, question):
-        t0 = time.perf_counter()
-        image = self._load_image(image_input)  # 同样使用 resize 加速 VQA
+        image = self._load_image(image_input)
         messages = [
             {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": question}]}]
         inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
@@ -184,7 +208,7 @@ class QwenWrapper:
         generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
         output_text = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True,
                                                   clean_up_tokenization_spaces=False)[0]
-        return output_text, (time.perf_counter() - t0)
+        return output_text
 
 
 # ==========================================
@@ -236,12 +260,10 @@ class AsyncQwenWorker:
                 task = self.input_queue.get(timeout=0.5)
                 frame, prompt, capture_time = task
 
-                # Qwen 推理
+                # 这里只传名词去检测，比如 "树"
                 results = self.model.detect_objects(frame, prompt)
 
                 self.output_queue.put((results, capture_time))
-
-                # 保持队列最新，丢弃旧结果
                 while self.output_queue.qsize() > 1:
                     self.output_queue.get()
             except queue.Empty:
@@ -251,7 +273,6 @@ class AsyncQwenWorker:
 
     def submit_task(self, frame, prompt):
         if self.input_queue.empty():
-            # 传入 capture_time 用于后续对齐轨迹
             self.input_queue.put((frame.copy(), prompt, time.time()))
 
     def get_result(self):
@@ -264,10 +285,7 @@ class AsyncQwenWorker:
 
 
 # ==========================================
-# 5. 混合追踪器 (优化：自动重找回)
-# ==========================================
-# ==========================================
-# 5. 混合追踪器 (加入平滑滤波抗抖动版)
+# 5. 混合追踪器 (集成指令解析与多目标逻辑)
 # ==========================================
 class HybridTracker:
     def __init__(self, model, correction_interval=1.0):
@@ -276,11 +294,12 @@ class HybridTracker:
         self.traj_buffer = TrajectoryBuffer(max_duration=4.0)
         self.tracker = None
         self.is_tracking = False
-        self.current_bbox = None  # 格式: (x, y, w, h)
-        self.target_prompt = None
-        self.last_submit_time = 0
+        self.current_bbox = None
 
-        # 【新增】平滑系数 (0.1 ~ 1.0)，越小越平滑，但响应越慢；越大越灵敏，但越抖动
+        # 状态保存
+        self.original_cmd = None  # 用户输入 "第二棵树"
+        self.target_noun = None  # 提取名词 "树"
+        self.last_submit_time = 0
         self.smooth_factor = 0.3
 
     def _xyxy_to_xywh(self, bbox):
@@ -288,7 +307,6 @@ class HybridTracker:
         return (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
 
     def _calculate_iou(self, boxA, boxB):
-        # box: (x, y, w, h)
         xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
         xB, yB = min(boxA[0] + boxA[2], boxB[0] + boxB[2]), min(boxA[1] + boxA[3], boxB[1] + boxB[3])
         interArea = max(0, xB - xA) * max(0, yB - yA)
@@ -297,47 +315,70 @@ class HybridTracker:
         return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
 
     def _smooth_bbox(self, old_box, new_box, factor):
-        """ 计算加权平均值来实现平滑移动 """
         ox, oy, ow, oh = old_box
         nx, ny, nw, nh = new_box
-
-        # 线性插值
         rx = int(ox * (1 - factor) + nx * factor)
         ry = int(oy * (1 - factor) + ny * factor)
         rw = int(ow * (1 - factor) + nw * factor)
         rh = int(oh * (1 - factor) + nh * factor)
-
         return (rx, ry, rw, rh)
 
     def init_smart(self, frame, user_input):
-        print(f"[Init] Asking Qwen to detect: '{user_input}'...")
-        results = self.worker.model.detect_objects(frame, user_input)
+        """
+        初始化逻辑：解析指令 -> 全量检测 -> 逻辑选择
+        """
+        self.original_cmd = user_input
+
+        # 1. 解析
+        target_noun, target_index, is_reverse = CommandParser.parse(user_input)
+        self.target_noun = target_noun
+
+        direction_str = "从右向左" if is_reverse else "从左向右"
+        print(f"[Init] 解析: '{user_input}' -> 找 '{target_noun}', 顺序: {direction_str}, 索引: {target_index}")
+
+        # 2. 检测
+        results = self.worker.model.detect_objects(frame, target_noun)
 
         if not results:
-            print("[Init] Qwen found nothing.")
+            print(f"[Init] 未在画面中找到 '{target_noun}'.")
             return False, None
 
-        target = results[0]
-        bbox_xywh = self._xyxy_to_xywh(target['bbox'])
+        # 3. 排序 (核心逻辑)
+        def get_center_x(res):
+            b = res['bbox']
+            return (b[0] + b[2]) / 2
 
+        # 根据是否倒序进行排序
+        sorted_results = sorted(results, key=get_center_x, reverse=is_reverse)
+
+        print(f"[Init] 找到 {len(sorted_results)} 个 '{target_noun}'.")
+
+        # 4. 选择
+        if target_index >= len(sorted_results):
+            print(f"[Warning] 索引 {target_index} 越界，已自动选择最后一个。")
+            target = sorted_results[-1]
+        else:
+            target = sorted_results[target_index]
+
+        # 5. 锁定
+        bbox_xywh = self._xyxy_to_xywh(target['bbox'])
         self.tracker = cv2.TrackerCSRT_create()
         self.tracker.init(frame, bbox_xywh)
         self.is_tracking = True
         self.current_bbox = bbox_xywh
-        self.target_prompt = user_input
         self.last_submit_time = time.time()
         self.traj_buffer.add(bbox_xywh)
+
         return True, bbox_xywh
 
     def update(self, frame):
-        # 1. 安全检查：无目标则空转
-        if not self.target_prompt:
+        if not self.target_noun:
             return False, None, "Idle", 0
 
         t_start = time.perf_counter()
         status = "Tracking"
 
-        # 2. CSRT 实时追踪 (高频，作为基础)
+        # 1. CSRT 追踪
         if self.is_tracking:
             ok, bbox = self.tracker.update(frame)
             if ok:
@@ -350,74 +391,81 @@ class HybridTracker:
         else:
             status = "Lost"
 
-        # 3. 异步修正 (低频，作为校准)
+        # 2. Qwen 异步修正
         async_res = self.worker.get_result()
         if async_res:
-            results, capture_timestamp = async_res
-            if results:
-                qwen_bbox_raw = results[0]['bbox']
-                qwen_bbox_xywh = self._xyxy_to_xywh(qwen_bbox_raw)
+            results_list, capture_timestamp = async_res
+            if results_list:
 
-                should_hard_reset = False  # 是否强制重置（用于找回丢失目标）
-                should_soft_correct = False  # 是否平滑修正（用于微调）
+                # 在所有结果中，寻找与当前追踪目标空间位置重叠度(IOU)最高的
+                best_match_bbox = None
+                max_iou = -1
 
-                if not self.is_tracking:
-                    # 之前跟丢了，现在找回来了 -> 强制重置
-                    should_hard_reset = True
-                    status = "Re-found"
-                else:
-                    # 正在跟，计算偏差
-                    iou = self._calculate_iou(self.current_bbox, qwen_bbox_xywh)
+                if self.is_tracking and self.current_bbox:
+                    dx, dy = self.traj_buffer.get_delta(capture_timestamp, self.current_bbox)
 
-                    # 【优化策略】
-                    # 情况A: IOU > 0.6 -> CSRT跟得很紧，Qwen只是微小抖动 -> 【忽略Qwen，不修正】
-                    # 情况B: 0.2 < IOU < 0.6 -> 有偏差，但还没丢 -> 【平滑修正】
-                    # 情况C: IOU < 0.2 -> 偏差极大，可能是CSRT漂移了 -> 【强制重置】
+                    for res in results_list:
+                        det_xywh = self._xyxy_to_xywh(res['bbox'])
+                        # 补偿位置
+                        comp_det_xywh = (det_xywh[0] + dx, det_xywh[1] + dy, det_xywh[2], det_xywh[3])
 
-                    if iou > 0.6:
-                        # 信任 CSRT，什么都不做，防止不动时闪烁
+                        iou = self._calculate_iou(self.current_bbox, comp_det_xywh)
+                        if iou > max_iou:
+                            max_iou = iou
+                            best_match_bbox = det_xywh
+
+                should_reinit = False
+                final_bbox = None
+
+                if self.is_tracking:
+                    if best_match_bbox and max_iou > 0.6:
+                        # 匹配良好，无需修正
                         pass
-                    elif iou > 0.2:
-                        should_soft_correct = True
-                        status = "Correcting..."
-                    else:
-                        should_hard_reset = True
-                        status = "Resetting"
+                    elif best_match_bbox and max_iou > 0.2:
+                        # 有偏差，进行平滑修正
+                        status = "Correcting"
+                        should_reinit = True
 
-                # 计算运动补偿 (因为 Qwen 的结果是 1秒前的)
-                dx, dy = self.traj_buffer.get_delta(capture_timestamp,
-                                                    self.current_bbox if self.current_bbox else qwen_bbox_xywh)
+                        dx, dy = self.traj_buffer.get_delta(capture_timestamp, self.current_bbox)
+                        target_pos = (
+                            int(best_match_bbox[0] + dx), int(best_match_bbox[1] + dy),
+                            best_match_bbox[2], best_match_bbox[3]
+                        )
+                        final_bbox = self._smooth_bbox(self.current_bbox, target_pos, self.smooth_factor)
 
-                # 补偿后的 Qwen 目标位置
-                compensated_bbox = (
-                    int(qwen_bbox_xywh[0] + dx),
-                    int(qwen_bbox_xywh[1] + dy),
-                    int(qwen_bbox_xywh[2]),
-                    int(qwen_bbox_xywh[3])
-                )
+                else:  # Lost 状态
+                    # 尝试找回最近的
+                    if self.current_bbox:
+                        cx, cy = self.current_bbox[0], self.current_bbox[1]
+                        min_dist = float('inf')
+                        closest_box = None
 
-                # 执行更新
-                if should_hard_reset:
-                    # 强制重置：直接跳过去
-                    final_bbox = compensated_bbox
+                        for res in results_list:
+                            det_xywh = self._xyxy_to_xywh(res['bbox'])
+                            dist = (det_xywh[0] - cx) ** 2 + (det_xywh[1] - cy) ** 2
+                            if dist < min_dist:
+                                min_dist = dist
+                                closest_box = det_xywh
+
+                        if closest_box and min_dist < 50000:  # 距离阈值
+                            status = "Re-found"
+                            should_reinit = True
+
+                            dx, dy = self.traj_buffer.get_delta(capture_timestamp, self.current_bbox)
+                            final_bbox = (
+                                int(closest_box[0] + dx), int(closest_box[1] + dy),
+                                closest_box[2], closest_box[3]
+                            )
+                            self.is_tracking = True
+
+                if should_reinit and final_bbox:
                     self.tracker = cv2.TrackerCSRT_create()
                     self.tracker.init(frame, final_bbox)
                     self.current_bbox = final_bbox
-                    self.is_tracking = True
 
-                elif should_soft_correct:
-                    # 平滑修正：在当前框和 Qwen 框之间取中间值
-                    # 使用 smooth_factor 控制“吸附”力度
-                    final_bbox = self._smooth_bbox(self.current_bbox, compensated_bbox, self.smooth_factor)
-
-                    # 修正 CSRT 的内部状态（这一步很重要，否则下一帧 CSRT 又会跳回去）
-                    self.tracker = cv2.TrackerCSRT_create()
-                    self.tracker.init(frame, final_bbox)
-                    self.current_bbox = final_bbox
-
-        # 4. 提交新任务
-        if self.target_prompt and (time.time() - self.last_submit_time > self.correction_interval):
-            self.worker.submit_task(frame, self.target_prompt)
+        # 3. 提交任务 (使用提取出的名词，如 "树")
+        if self.target_noun and (time.time() - self.last_submit_time > self.correction_interval):
+            self.worker.submit_task(frame, self.target_noun)
             self.last_submit_time = time.time()
 
         return self.is_tracking, self.current_bbox, status, (time.perf_counter() - t_start)
@@ -427,9 +475,9 @@ class HybridTracker:
 # 6. 主程序
 # ==========================================
 def run_demo():
-    # 路径配置
+    # 你的本地路径
     MODEL_PATH = r"C:\Users\qijiu\.cache\modelscope\hub\models\Qwen\Qwen3-VL-2B-Instruct"
-    VIDEO_PATH = "1.mp4"
+    VIDEO_PATH = "2.mp4"
 
     if not os.path.exists(VIDEO_PATH):
         print(f"[Error] Video not found: {VIDEO_PATH}")
@@ -440,106 +488,69 @@ def run_demo():
         print("[Error] Failed to open video.")
         return
 
-    # 1. 初始化 FPS 控制器
     fps_controller = VideoFPSController(cap)
 
-    # 2. 加载模型
     try:
         qwen_wrapper = QwenWrapper(MODEL_PATH)
     except Exception as e:
         print(f"[Error] Model load failed: {e}")
         return
 
-    # 3. 初始化追踪器
     tracker = HybridTracker(qwen_wrapper, correction_interval=1.0)
 
     ret, frame = cap.read()
     if not ret: return
 
-    print("\n" + "=" * 40)
-    print(" QWEN-VL TRACKER READY ")
-    print("=" * 40)
+    print("\n" + "=" * 50)
+    print(" QWEN-VL 智能中文追踪器 (修正版) ")
+    print(" 示例输入:")
+    print("  - 第二棵树")
+    print("  - 倒数第一辆车")
+    print("  - 最右边的房子")
+    print("=" * 50)
 
-    # 获取初始目标
-    user_cmd = input("Target to track (e.g., 'car', 'person'): ").strip()
-    if not user_cmd: user_cmd = "car"
+    user_cmd = input("请输入要追踪的目标: ").strip()
+    if not user_cmd: user_cmd = "第一棵树"
 
     success, _ = tracker.init_smart(frame, user_cmd)
     if not success:
-        print("[Error] Init failed. Object not found.")
-        tracker.shutdown()
+        print("[Error] 初始化失败.")
+        tracker.worker.stop()
         return
 
-    print("[Info] Tracking started. Press 'q' to quit, 'space' for VQA.")
+    print("[Info] 追踪已开始. 按 'q' 退出.")
 
     try:
         while True:
-            # 记录循环开始时间，用于 FPS 同步
             loop_start = time.time()
-
             ret, frame = cap.read()
-            if not ret:
-                print("[Info] End of video.")
-                break
+            if not ret: break
 
             display_frame = frame.copy()
-
-            # 追踪更新
             is_tracking, bbox, status, lat = tracker.update(frame)
 
             if is_tracking and bbox:
                 x, y, w, h = [int(v) for v in bbox]
-                color = (0, 255, 255) if "Corrected" in status or "Re-found" in status else (0, 255, 0)
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
 
-                # 状态栏
-                info = f"Target: {user_cmd} | {status} | Lat: {lat * 1000:.0f}ms"
+                color = (0, 255, 0)
+                if "Correcting" in status: color = (0, 255, 255)
+                if "Re-found" in status: color = (255, 0, 255)
+
+                cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
+                info = f"{tracker.original_cmd} | {status} | Lat: {lat * 1000:.0f}ms"
                 cv2.putText(display_frame, info, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             else:
-                cv2.putText(display_frame, f"Lost: {user_cmd} (Searching...)", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                cv2.putText(display_frame, f"丢失: {tracker.original_cmd}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 255), 2)
 
             cv2.imshow("Qwen Tracker", display_frame)
-
-            # 计算需要等待的时间以保持 1倍速
             wait_ms = fps_controller.sync(loop_start)
-
-            key = cv2.waitKey(wait_ms) & 0xFF
-
-            if key == ord('q'):
-                break
-            elif key == ord(' '):
-                # 暂停视频进行 VQA
-                cv2.putText(display_frame, "Thinking...", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-                cv2.imshow("Qwen Tracker", display_frame)
-                cv2.waitKey(1)
-
-                q = input("\n[VQA] Question: ")
-                if not q: q = "Describe this object."
-
-                # 裁剪出当前追踪的物体图（如果有），否则用全图
-                query_img = frame
-                if is_tracking and bbox:
-                    x, y, w, h = [int(v) for v in bbox]
-                    # 稍微外扩一点
-                    h_img, w_img = frame.shape[:2]
-                    x1, y1 = max(0, x), max(0, y)
-                    x2, y2 = min(w_img, x + w), min(h_img, y + h)
-                    if x2 > x1 and y2 > y1:
-                        query_img = frame[y1:y2, x1:x2]
-
-                ans, t = qwen_wrapper.ask_question(query_img, q)
-                print(f"Qwen: {ans} ({t:.2f}s)")
-                print("-" * 30)
+            if cv2.waitKey(wait_ms) & 0xFF == ord('q'): break
 
     except KeyboardInterrupt:
-        print("Stopped by user.")
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+        pass
     finally:
-        tracker.shutdown()
+        tracker.worker.stop()
         cap.release()
         cv2.destroyAllWindows()
 
